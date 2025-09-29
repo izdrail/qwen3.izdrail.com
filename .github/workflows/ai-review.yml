@@ -1,0 +1,480 @@
+name: 'Ai review using CloudFlare workers'
+
+on:
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  analyze_pr:
+    name: 'Send All PR Files to Cloudflare AI Workers'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Debug Environment
+        run: |
+          echo "=== Environment Debug ==="
+          echo "Repository: ${{ github.repository }}"
+          echo "PR Number: ${{ github.event.pull_request.number }}"
+          echo "Event Action: ${{ github.event.action }}"
+          echo "Base Branch: ${{ github.event.pull_request.base.ref }}"
+          echo "Head Branch: ${{ github.event.pull_request.head.ref }}"
+
+      - name: Get Changed Files and Send to Cloudflare Workers AI
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          AI_MODEL: "@cf/meta/llama-3.1-8b-instruct"
+        run: |
+          set -e  # Exit on any error
+
+          echo "=== Getting all changed files in PR #${{ github.event.pull_request.number }} ==="
+
+          # Construct API URL
+          API_URL="https://api.github.com/repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files"
+          echo "API URL: $API_URL"
+
+          # Get all changed files with comprehensive error handling
+          echo "Making request to GitHub API..."
+          FILES_RESPONSE=$(curl -s -w "\nHTTP_STATUS:%{http_code}\nHTTP_SIZE:%{size_download}" \
+            "$API_URL" \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github.v3+json" \
+            -H "User-Agent: GitHub-Actions")
+
+          # Extract HTTP status and response body using more reliable method
+          HTTP_STATUS=$(echo "$FILES_RESPONSE" | tail -n 2 | grep "^HTTP_STATUS:" | cut -d':' -f2)
+          RESPONSE_SIZE=$(echo "$FILES_RESPONSE" | tail -n 1 | grep "^HTTP_SIZE:" | cut -d':' -f2)
+          RESPONSE_BODY=$(echo "$FILES_RESPONSE" | head -n -2)
+
+          echo "HTTP Status: $HTTP_STATUS"
+          echo "Response Size: $RESPONSE_SIZE bytes"
+
+          # Check HTTP status first
+          if [ "$HTTP_STATUS" != "200" ]; then
+            echo "❌ GitHub API request failed with HTTP status: $HTTP_STATUS"
+            echo "Response body: $RESPONSE_BODY"
+
+            # Post error comment to PR
+            ERROR_MSG="🚨 **GitHub API Error**\n\nFailed to fetch changed files from GitHub API.\n\n**Error Details:**\n- HTTP Status: $HTTP_STATUS\n- API URL: $API_URL\n\n*Please check repository permissions and try again.*"
+
+            curl -s -X POST \
+              -H "Authorization: Bearer $GITHUB_TOKEN" \
+              -H "Accept: application/vnd.github.v3+json" \
+              -H "Content-Type: application/json" \
+              -d "{\"body\": \"$ERROR_MSG\"}" \
+              "${{ github.event.pull_request.comments_url }}" || echo "Failed to post error comment"
+
+            exit 1
+          fi
+
+          # Check if response is empty
+          if [ "$RESPONSE_SIZE" -eq 0 ] || [ -z "$RESPONSE_BODY" ]; then
+            echo "❌ Empty response from GitHub API"
+            exit 1
+          fi
+
+          # Validate JSON format
+          if ! echo "$RESPONSE_BODY" | jq empty 2>/dev/null; then
+            echo "❌ Invalid JSON response from GitHub API"
+            echo "Raw response (first 500 chars): ${RESPONSE_BODY:0:500}"
+            exit 1
+          fi
+
+          # Check if we got an empty array (no files changed)
+          FILE_COUNT=$(echo "$RESPONSE_BODY" | jq 'length')
+          if [ "$FILE_COUNT" -eq 0 ]; then
+            echo "ℹ️ No files changed in this PR"
+
+            NO_FILES_MSG="📝 **No Files Changed**\n\nThis pull request doesn't contain any file changes to analyze."
+            curl -s -X POST \
+              -H "Authorization: Bearer $GITHUB_TOKEN" \
+              -H "Accept: application/vnd.github.v3+json" \
+              -H "Content-Type: application/json" \
+              -d "{\"body\": \"$NO_FILES_MSG\"}" \
+              "${{ github.event.pull_request.comments_url }}"
+
+            exit 0
+          fi
+
+          echo "✅ Found $FILE_COUNT changed files"
+
+          # Build the complete message with all files
+          PR_TITLE="${{ github.event.pull_request.title }}"
+          PR_DESCRIPTION="${{ github.event.pull_request.body }}"
+
+          # Clean up PR description (remove null, escape quotes)
+          if [ "$PR_DESCRIPTION" = "null" ] || [ -z "$PR_DESCRIPTION" ]; then
+            PR_DESCRIPTION="No description provided"
+          fi
+
+          # Initialize the complete message file
+          MESSAGE_FILE="/tmp/pr_analysis_request.txt"
+
+          cat > "$MESSAGE_FILE" << 'EOF'
+          Pull Request Analysis Request
+
+          PR Title: $PR_TITLE
+          PR Description: $PR_DESCRIPTION
+          Repository: ${{ github.repository }}
+          PR Number: ${{ github.event.pull_request.number }}
+          Files Changed: $FILE_COUNT
+
+          Changed Files and Diffs:
+          EOF
+
+          echo "=== DEBUG: Processing Files ==="
+
+          # Process each file and add to message file
+          FILE_INDEX=0
+          echo "$RESPONSE_BODY" | jq -c '.[]' | while IFS= read -r file; do
+            FILE_INDEX=$((FILE_INDEX + 1))
+            FILENAME=$(echo "$file" | jq -r '.filename')
+            STATUS=$(echo "$file" | jq -r '.status')
+            ADDITIONS=$(echo "$file" | jq -r '.additions // 0')
+            DELETIONS=$(echo "$file" | jq -r '.deletions // 0')
+            PATCH=$(echo "$file" | jq -r '.patch // "No diff available"')
+
+            echo "Processing File #$FILE_INDEX: $FILENAME ($STATUS, +$ADDITIONS -$DELETIONS)"
+            echo "Patch length: ${#PATCH} characters"
+
+            # Show first 200 chars of patch for debugging
+            echo "Patch preview: ${PATCH:0:200}..."
+
+            # Truncate very large patches to avoid overwhelming the AI
+            if [ ${#PATCH} -gt 6000 ]; then
+              PATCH="${PATCH:0:6000}... [TRUNCATED - diff too long]"
+              echo "Truncated patch to 6000 characters"
+            fi
+
+            # Append to message file
+            cat >> "$MESSAGE_FILE" << EOF
+
+          File: $FILENAME
+          Status: $STATUS
+          Changes: +$ADDITIONS -$DELETIONS lines
+
+          Diff:
+          $PATCH
+
+          ---
+          EOF
+
+          done
+
+          # Add analysis instructions to the message file
+          cat >> "$MESSAGE_FILE" << 'EOF'
+
+          Analysis Request:
+          Please analyze all the above code changes and provide:
+          1. Overall code quality assessment: Assess readability, maintainability, modularity, and adherence to coding standards. Use a 1–5 rating scale (⭐) and justify the score.
+          2. Potential bugs or issues found: List in a table format with file, line, issue, and severity.
+          3. Security concerns if any: Identify possible vulnerabilities, unsafe practices, or data leaks and rate each by severity and provide mitigation steps.
+          4. Performance considerations: Highlight scalability issues, efficiency concerns, and bottlenecks. Recommend optimizations where applicable.
+          5. Best practice recommendations: Check against SOLID, DRY, KISS, YAGNI principles. Suggest language/framework-specific improvements.
+          6. Summary of what this PR accomplishes: Concisely state what the PR accomplishes, its intended impact, and any risks to merging.
+
+          Please be thorough but concise in your analysis.
+          EOF
+
+          # Read the complete message and show debug info
+          FINAL_MESSAGE=$(cat "$MESSAGE_FILE")
+          echo "=== DEBUG: Final Message Statistics ==="
+          echo "Total message length: ${#FINAL_MESSAGE} characters"
+          echo "Message line count: $(echo "$FINAL_MESSAGE" | wc -l)"
+          echo ""
+          echo "=== DEBUG: Message Preview (First 1000 chars) ==="
+          echo "${FINAL_MESSAGE:0:1000}"
+          echo "... [TRUNCATED FOR DEBUG]"
+          echo ""
+
+          # Show the tail of the message to verify analysis instructions
+          echo "=== DEBUG: Message End (Last 500 chars) ==="
+          echo "${FINAL_MESSAGE: -500}"
+          echo ""
+
+          echo "=== Sending to Cloudflare Workers AI ==="
+          echo "Message length: ${#FINAL_MESSAGE} characters"
+
+          # Construct Cloudflare Workers AI endpoint
+          CF_AI_ENDPOINT="https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/ai/run/$AI_MODEL"
+          echo "Cloudflare AI Endpoint: $CF_AI_ENDPOINT"
+
+          # Create the request payload for Cloudflare Workers AI
+          REQUEST_JSON=$(jq -n \
+            --arg prompt "$FINAL_MESSAGE" \
+            '{
+              "messages": [
+                {
+                  "role": "system",
+                  "content": "You are an expert code reviewer and software engineer. Provide detailed, constructive analysis of code changes in pull requests. Focus on code quality, security, performance, and best practices."
+                },
+                {
+                  "role": "user",
+                  "content": $prompt
+                }
+              ],
+              "max_tokens": 3000,
+              "temperature": 0.3,
+              "top_p": 0.9
+            }')
+
+          echo "Request JSON size: ${#REQUEST_JSON} characters"
+
+          # Save the request JSON for debugging
+          echo "$REQUEST_JSON" > /tmp/cf_ai_request.json
+          echo "=== DEBUG: Cloudflare AI Request JSON Preview ==="
+          echo "$REQUEST_JSON" | jq '{max_tokens, temperature, top_p, messages: [.messages[0], {role: .messages[1].role, content: (.messages[1].content | .[0:500] + "...")}]}'
+          echo ""
+
+          # Test Cloudflare API connectivity first
+          echo "=== DEBUG: Testing Cloudflare AI Connectivity ==="
+          echo "Testing endpoint: $CF_AI_ENDPOINT"
+
+          # Test with a simple health check to the base API
+          PING_RESPONSE=$(curl -s -w "HTTP_STATUS:%{http_code}" --max-time 10 \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            -H "Content-Type: application/json" \
+            -X GET "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID" 2>/dev/null || echo "CURL_FAILED")
+
+          echo "Ping response: $PING_RESPONSE"
+
+          if echo "$PING_RESPONSE" | grep -q "CURL_FAILED"; then
+            echo "❌ Cannot reach Cloudflare API"
+
+            ERROR_MSG="🚨 **Cloudflare AI Service Unreachable**\n\nCannot connect to Cloudflare Workers AI service.\n\n**Possible Issues:**\n- Invalid API token or Account ID\n- Network connectivity problems\n- Cloudflare API is down\n\n*Please check your Cloudflare credentials and service status.*"
+
+            curl -s -X POST \
+              -H "Authorization: Bearer $GITHUB_TOKEN" \
+              -H "Accept: application/vnd.github.v3+json" \
+              -H "Content-Type: application/json" \
+              -d "{\"body\": \"$ERROR_MSG\"}" \
+              "${{ github.event.pull_request.comments_url }}"
+
+            exit 1
+          fi
+
+          echo "✅ Cloudflare API is reachable"
+
+          # Send to Cloudflare Workers AI with timeout and better error handling
+          echo "=== DEBUG: Sending Request to Cloudflare Workers AI ==="
+          echo "Sending analysis request to Cloudflare AI..."
+
+          AI_RESPONSE=$(curl -s -w "\nHTTP_STATUS:%{http_code}" --max-time 180 \
+            -X POST \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$REQUEST_JSON" \
+            "$CF_AI_ENDPOINT" 2>/dev/null || echo "CURL_FAILED")
+
+          # Save the raw response for debugging
+          echo "$AI_RESPONSE" > /tmp/cf_ai_response.txt
+
+          echo "=== DEBUG: Raw Cloudflare AI Response ==="
+          echo "Raw response length: ${#AI_RESPONSE} characters"
+          echo "Raw response (first 1000 chars):"
+          echo "${AI_RESPONSE:0:1000}"
+          if [ ${#AI_RESPONSE} -gt 1000 ]; then
+            echo "... [TRUNCATED FOR DEBUG - total length: ${#AI_RESPONSE} chars]"
+          fi
+          echo ""
+
+          if echo "$AI_RESPONSE" | grep -q "CURL_FAILED"; then
+            echo "❌ Cloudflare AI request failed (curl error)"
+
+            ERROR_MSG="🚨 **Cloudflare AI Request Failed**\n\nFailed to send request to Cloudflare Workers AI service.\n\n**Possible Issues:**\n- Request timeout (>180s)\n- API token invalid or expired\n- Model not available\n- Request too large\n\n*Please check your Cloudflare AI service configuration.*"
+
+            curl -s -X POST \
+              -H "Authorization: Bearer $GITHUB_TOKEN" \
+              -H "Accept: application/vnd.github.v3+json" \
+              -H "Content-Type: application/json" \
+              -d "{\"body\": \"$ERROR_MSG\"}" \
+              "${{ github.event.pull_request.comments_url }}"
+
+            exit 1
+          fi
+
+          # Parse Cloudflare AI response
+          echo "=== DEBUG: Parsing Cloudflare AI Response ==="
+          AI_HTTP_STATUS=$(echo "$AI_RESPONSE" | tail -n 1 | grep "^HTTP_STATUS:" | cut -d':' -f2)
+          AI_RESPONSE_BODY=$(echo "$AI_RESPONSE" | head -n -1)
+
+          echo "Extracted HTTP Status: '$AI_HTTP_STATUS'"
+          echo "Response Body Length: ${#AI_RESPONSE_BODY} characters"
+          echo "Response Body (first 1000 chars):"
+          echo "${AI_RESPONSE_BODY:0:1000}"
+          if [ ${#AI_RESPONSE_BODY} -gt 1000 ]; then
+            echo "... [TRUNCATED FOR DEBUG]"
+          fi
+          echo ""
+
+          if [ "$AI_HTTP_STATUS" -eq 200 ]; then
+            echo "=== DEBUG: Processing Successful Cloudflare AI Response ==="
+            # Validate AI response JSON
+            if ! echo "$AI_RESPONSE_BODY" | jq empty 2>/dev/null; then
+              echo "❌ Invalid JSON response from Cloudflare AI"
+              echo "=== DEBUG: Invalid JSON Analysis ==="
+              echo "Raw response body:"
+              echo "$AI_RESPONSE_BODY"
+
+              ERROR_MSG="🚨 **Cloudflare AI Response Error**\n\nReceived invalid response from Cloudflare Workers AI service.\n\n*Please check the AI service configuration.*"
+
+              curl -s -X POST \
+                -H "Authorization: Bearer $GITHUB_TOKEN" \
+                -H "Accept: application/vnd.github.v3+json" \
+                -H "Content-Type: application/json" \
+                -d "{\"body\": \"$ERROR_MSG\"}" \
+                "${{ github.event.pull_request.comments_url }}"
+
+              exit 1
+            fi
+
+            echo "✅ Cloudflare AI response is valid JSON"
+
+            # Debug: Show JSON structure
+            echo "=== DEBUG: JSON Structure Analysis ==="
+            echo "Available fields in response:"
+            echo "$AI_RESPONSE_BODY" | jq 'keys // "Not an object"'
+            echo ""
+
+            # Extract the analysis from Cloudflare AI response
+            echo "=== DEBUG: Extracting Analysis Content ==="
+
+            # Cloudflare Workers AI typically returns response in result.response format
+            ANALYSIS_RESULT=$(echo "$AI_RESPONSE_BODY" | jq -r '.result.response // empty')
+            ANALYSIS_CONTENT=$(echo "$AI_RESPONSE_BODY" | jq -r '.result.content // empty')
+            ANALYSIS_MESSAGE=$(echo "$AI_RESPONSE_BODY" | jq -r '.result.messages[0].content // empty')
+
+            # Also check for direct response fields
+            ANALYSIS_DIRECT=$(echo "$AI_RESPONSE_BODY" | jq -r '.response // empty')
+
+            # Use the first non-empty field
+            if [ -n "$ANALYSIS_RESULT" ] && [ "$ANALYSIS_RESULT" != "null" ]; then
+              ANALYSIS="$ANALYSIS_RESULT"
+              echo "✅ Using .result.response field for analysis"
+            elif [ -n "$ANALYSIS_CONTENT" ] && [ "$ANALYSIS_CONTENT" != "null" ]; then
+              ANALYSIS="$ANALYSIS_CONTENT"
+              echo "✅ Using .result.content field for analysis"
+            elif [ -n "$ANALYSIS_MESSAGE" ] && [ "$ANALYSIS_MESSAGE" != "null" ]; then
+              ANALYSIS="$ANALYSIS_MESSAGE"
+              echo "✅ Using .result.messages[0].content field for analysis"
+            elif [ -n "$ANALYSIS_DIRECT" ] && [ "$ANALYSIS_DIRECT" != "null" ]; then
+              ANALYSIS="$ANALYSIS_DIRECT"
+              echo "✅ Using .response field for analysis"
+            else
+              ANALYSIS="❌ No analysis content found in Cloudflare AI response.
+
+          Available fields: $(echo "$AI_RESPONSE_BODY" | jq 'keys // "none"')
+
+          Raw response:
+          \`\`\`json
+          $AI_RESPONSE_BODY
+          \`\`\`"
+              echo "❌ No analysis content found in any expected field"
+            fi
+
+            echo "=== DEBUG: Final Analysis Content ==="
+            echo "Analysis length: ${#ANALYSIS} characters"
+            echo "Analysis preview (first 500 chars):"
+            echo "${ANALYSIS:0:500}"
+            if [ ${#ANALYSIS} -gt 500 ]; then
+              echo "... [TRUNCATED FOR DEBUG]"
+            fi
+            echo ""
+
+            # Post the analysis as a PR comment
+            COMMENT_BODY="🤖 **Automated Code Analysis**
+
+            $ANALYSIS
+
+          ---
+          *Analysis performed by Cloudflare Workers AI (\`$AI_MODEL\`) on $(date -u '+%Y-%m-%d %H:%M:%S UTC')*
+
+            <details>
+            <summary>📊 Request Details</summary>
+
+          - **Files Analyzed:** $FILE_COUNT
+          - **Request Size:** ${#FINAL_MESSAGE} characters
+          - **Response Size:** ${#AI_RESPONSE_BODY} characters
+          - **AI Model:** $AI_MODEL
+          - **Service:** Cloudflare Workers AI
+
+            </details>"
+
+            # Create JSON for comment with proper escaping
+            COMMENT_JSON=$(jq -n --arg body "$COMMENT_BODY" '{body: $body}')
+
+            echo "=== DEBUG: Posting Comment to PR ==="
+            echo "Comment URL: ${{ github.event.pull_request.comments_url }}"
+            echo "Comment size: ${#COMMENT_BODY} characters"
+
+            COMMENT_RESPONSE=$(curl -s -w "\nHTTP_STATUS:%{http_code}" -X POST \
+              -H "Authorization: Bearer $GITHUB_TOKEN" \
+              -H "Accept: application/vnd.github.v3+json" \
+              -H "Content-Type: application/json" \
+              -d "$COMMENT_JSON" \
+              "${{ github.event.pull_request.comments_url }}")
+
+            COMMENT_HTTP_STATUS=$(echo "$COMMENT_RESPONSE" | tail -n 1 | grep "^HTTP_STATUS:" | cut -d':' -f2)
+
+            if [ "$COMMENT_HTTP_STATUS" -eq 201 ]; then
+              echo "✅ Successfully posted Cloudflare AI analysis to PR"
+            else
+              echo "❌ Failed to post comment. Status: $COMMENT_HTTP_STATUS"
+              echo "Comment response: $(echo "$COMMENT_RESPONSE" | head -n -1)"
+            fi
+
+          else
+            echo "❌ Cloudflare AI request failed with status: $AI_HTTP_STATUS"
+
+            # Post detailed error message to PR
+            ERROR_COMMENT="🚨 **Cloudflare AI Analysis Failed**
+
+            The automated code analysis could not be completed.
+
+            **Error Details:**
+          - HTTP Status: $AI_HTTP_STATUS
+          - AI Model: $AI_MODEL
+          - Service: Cloudflare Workers AI
+          - Request Size: ${#FINAL_MESSAGE} characters
+          - Response Size: ${#AI_RESPONSE_BODY} characters
+
+            **Response Preview:**
+            \`\`\`
+            ${AI_RESPONSE_BODY:0:1000}
+            \`\`\`
+
+            **Troubleshooting:**
+          - Check if the Cloudflare API token is valid
+          - Verify the Account ID is correct
+          - Check if the AI model is available
+          - Ensure request size is within limits
+          - Verify Cloudflare AI service status
+
+          ---
+          *Failed on $(date -u '+%Y-%m-%d %H:%M:%S UTC')*"
+
+            ERROR_JSON=$(jq -n --arg body "$ERROR_COMMENT" '{body: $body}')
+
+            curl -s -X POST \
+              -H "Authorization: Bearer $GITHUB_TOKEN" \
+              -H "Accept: application/vnd.github.v3+json" \
+              -H "Content-Type: application/json" \
+              -d "$ERROR_JSON" \
+              "${{ github.event.pull_request.comments_url }}"
+
+            exit 1
+          fi
